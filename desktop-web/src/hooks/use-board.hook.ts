@@ -1,50 +1,20 @@
+// File: hooks/use-board.hook.ts
 'use client'
 
-import * as THREE from 'three';
 import { useRef, useEffect, useCallback } from 'react';
-import {CANVAS_BOARD_CONSTANTS} from '../constants/canvas-board.constants'
+import { CANVAS_BOARD_CONSTANTS } from '../constants/canvas-board.constants';
 import { useBoardStore } from '@/context/use-board-store';
-const {MIN_ZOOM,MAX_ZOOM,OFFSCREEN_CANVAS_SIZE} = CANVAS_BOARD_CONSTANTS;
 
+const { MIN_ZOOM, MAX_ZOOM, OFFSCREEN_CANVAS_SIZE } = CANVAS_BOARD_CONSTANTS;
 
-// Throttle funksiyasi
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const throttle = <T extends (...args: any[]) => any>(func: T, limit: number): ((...args: Parameters<T>) => void) => {
-  let inThrottle: boolean;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return function (this: any, ...args: Parameters<T>) {
-    if (!inThrottle) {
-      func.apply(this, args);
-      inThrottle = true;
-      setTimeout(() => (inThrottle = false), limit);
-    }
-  };
-};
-
-// Hook'da qaytariladigan qiymatlar uchun interfeys
-interface BoardState {
-  mode: 'draw' | 'pan';
-  setMode: (mode: 'draw' | 'pan') => void;
-  resetView: () => void;
-  clearCanvas: () => void;
-  canvasRef: React.RefObject<HTMLCanvasElement | null>;
-  eventHandlers: {
-    onMouseDown: (e: React.MouseEvent) => void;
-    onMouseMove: (e: React.MouseEvent) => void;
-    onMouseUp: () => void;
-    onMouseLeave: () => void;
-    onWheel: (e: React.WheelEvent) => void;
-  };
-}
-
-export const useBoard = (): BoardState => {
+export const useBoard = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const sceneRef = useRef<THREE.Scene | null>(null);
-  const cameraRef = useRef<THREE.OrthographicCamera | null>(null);
-  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
-  const linesRef = useRef<THREE.Line[]>([]);
+  const offscreenCanvas = useRef<HTMLCanvasElement | null>(null);
+  const pathCache = useRef<Path2D[]>([]);
+  const worldOrigin = useRef({ x: OFFSCREEN_CANVAS_SIZE.width / 2, y: OFFSCREEN_CANVAS_SIZE.height / 2 });
+  const animationFrame = useRef<number | null>(null);
+  const dirty = useRef(false);
 
-  // Zustand store'dan holatlarni olish
   const {
     mode,
     offset,
@@ -64,212 +34,196 @@ export const useBoard = (): BoardState => {
     clearCanvas,
   } = useBoardStore();
 
-  // Kanvas koordinatalarini hisoblash
-  const getCanvasCoords = useCallback(
-    (clientX: number, clientY: number) => {
-      const canvas = canvasRef.current;
-      if (!canvas) return { x: 0, y: 0 };
-      const rect = canvas.getBoundingClientRect();
-      const x = ((clientX - rect.left) - offset.x) / zoom;
-      const y = -((clientY - rect.top) - offset.y) / zoom; // Y o'qi teskari
-      return { x, y };
-    },
-    [offset, zoom]
-  );
+  const getCanvasCoords = useCallback((clientX: number, clientY: number) => {
+    return {
+      x: (clientX - offset.x) / zoom,
+      y: (clientY - offset.y) / zoom,
+    };
+  }, [offset, zoom]);
 
-  // Sahna va rendererni sozlash
-  useEffect(() => {
+  const drawMainCanvas = useCallback(() => {
+    const canvas = canvasRef.current;
+    const offCanvas = offscreenCanvas.current;
+    if (!canvas || !offCanvas) return;
+
+    const ctx = canvas.getContext('2d');
+    const offCtx = offCanvas.getContext('2d');
+    if (!ctx || !offCtx) return;
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#f0f0f0';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    if (!isFinite(zoom) || zoom <= 0) return;
+
+    ctx.save();
+    ctx.translate(offset.x, offset.y);
+    ctx.scale(zoom, zoom);
+
+    // Dot grid chizish - zoom bo'yicha radius ni cheklash
+    const spacing = 20;
+    const baseRadius = 1;
+    // Dot radius ni zoom bo'yicha normallashtirish va maksimal qiymat berish
+    const dotRadius = Math.min(baseRadius / zoom, 2);
+    
+    // Faqat zoom yetarlicha katta bo'lganda dot larni ko'rsatish
+    if (zoom > 0.3) {
+      ctx.fillStyle = '#ccc';
+
+      const viewBounds = {
+        xMin: -offset.x / zoom,
+        xMax: (canvas.width - offset.x) / zoom,
+        yMin: -offset.y / zoom,
+        yMax: (canvas.height - offset.y) / zoom,
+      };
+
+      const xStart = Math.floor(viewBounds.xMin / spacing) * spacing;
+      const yStart = Math.floor(viewBounds.yMin / spacing) * spacing;
+      
+      for (let x = xStart; x < viewBounds.xMax; x += spacing) {
+        for (let y = yStart; y < viewBounds.yMax; y += spacing) {
+          ctx.beginPath();
+          ctx.arc(x, y, dotRadius, 0, 2 * Math.PI);
+          ctx.fill();
+        }
+      }
+    }
+
+    // Offscreen canvas da chiziqlarni chizish
+    offCtx.clearRect(0, 0, offCanvas.width, offCanvas.height);
+    offCtx.strokeStyle = '#000000';
+    offCtx.lineWidth = 2 / zoom;
+    offCtx.lineCap = 'round';
+    offCtx.lineJoin = 'round';
+
+    const origin = worldOrigin.current;
+    for (const path of pathCache.current) {
+      offCtx.stroke(path);
+    }
+
+    ctx.drawImage(offCanvas, -origin.x, -origin.y);
+    ctx.restore();
+  }, [offset, zoom]);
+
+  const scheduleDraw = useCallback(() => {
+    if (!dirty.current) {
+      dirty.current = true;
+      animationFrame.current = requestAnimationFrame(() => {
+        drawMainCanvas();
+        dirty.current = false;
+      });
+    }
+  }, [drawMainCanvas]);
+
+  const handleWheel = useCallback((e: WheelEvent) => {
+    e.preventDefault();
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    // Sahna yaratish
-    const scene = new THREE.Scene();
-    sceneRef.current = scene;
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+    const worldX = (mouseX - offset.x) / zoom;
+    const worldY = (mouseY - offset.y) / zoom;
 
-    // Ortografik kamera
-    const aspect = window.innerWidth / window.innerHeight;
-    const frustumSize = OFFSCREEN_CANVAS_SIZE.height;
-    const camera = new THREE.OrthographicCamera(
-      (frustumSize * aspect) / -2,
-      (frustumSize * aspect) / 2,
-      frustumSize / 2,
-      frustumSize / -2,
-      0.1,
-      1000
-    );
-    camera.position.z = 10;
-    cameraRef.current = camera;
+    const zoomFactor = 1.0 - e.deltaY * 0.001;
+    const proposedZoom = zoom * zoomFactor;
+    const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, proposedZoom));
 
-    // Renderer
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setClearColor(0xf0f0f0);
-    rendererRef.current = renderer;
+    if (!isFinite(newZoom) || newZoom <= 0) return;
 
-    // Grid yaratish
-    const gridGeometry = new THREE.PlaneGeometry(OFFSCREEN_CANVAS_SIZE.width, OFFSCREEN_CANVAS_SIZE.height);
-    const gridMaterial = new THREE.ShaderMaterial({
-      uniforms: {
-        spacing: { value: 20.0 },
-        dotRadius: { value: 0.5 },
-        color: { value: new THREE.Color(0xcccccc) },
-      },
-      vertexShader: `
-        varying vec2 vUv;
-        void main() {
-          vUv = uv;
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-        }
-      `,
-      fragmentShader: `
-        uniform float spacing;
-        uniform float dotRadius;
-        uniform vec3 color;
-        varying vec2 vUv;
-        void main() {
-          vec2 grid = fract(vUv * vec2(${OFFSCREEN_CANVAS_SIZE.width.toFixed(1)}, ${OFFSCREEN_CANVAS_SIZE.height.toFixed(1)}) / spacing);
-          float dist = length(grid);
-          if (dist < dotRadius / spacing) {
-            gl_FragColor = vec4(color, 1.0);
-          } else {
-            discard;
-          }
-        }
-      `,
-      transparent: true,
-    });
-    const gridMesh = new THREE.Mesh(gridGeometry, gridMaterial);
-    scene.add(gridMesh);
+    const newOffsetX = mouseX - worldX * newZoom;
+    const newOffsetY = mouseY - worldY * newZoom;
 
-    // Render loop
-    const animate = () => {
-      if (!rendererRef.current || !sceneRef.current || !cameraRef.current) return;
-      requestAnimationFrame(animate);
-      rendererRef.current.render(sceneRef.current, cameraRef.current);
-    };
-    animate();
+    setZoom(newZoom);
+    setOffset({ x: newOffsetX, y: newOffsetY });
+  }, [offset, zoom, setZoom, setOffset]);
 
-    // Resize handler
-    const handleResize = () => {
-      const width = window.innerWidth;
-      const height = window.innerHeight;
-      renderer.setSize(width, height);
-      camera.left = (frustumSize * (width / height)) / -2;
-      camera.right = (frustumSize * (width / height)) / 2;
-      camera.top = frustumSize / 2;
-      camera.bottom = frustumSize / -2;
-      camera.updateProjectionMatrix();
-    };
-    window.addEventListener('resize', handleResize);
-    handleResize();
-
-    return () => {
-      window.removeEventListener('resize', handleResize);
-      renderer.dispose();
-    };
+  useEffect(() => {
+    if (!offscreenCanvas.current) {
+      const canvas = document.createElement('canvas');
+      canvas.width = OFFSCREEN_CANVAS_SIZE.width;
+      canvas.height = OFFSCREEN_CANVAS_SIZE.height;
+      offscreenCanvas.current = canvas;
+      worldOrigin.current = {
+        x: canvas.width / 2,
+        y: canvas.height / 2,
+      };
+    }
   }, []);
 
-  // Kamera pozitsiyasini yangilash
   useEffect(() => {
-    if (cameraRef.current) {
-      cameraRef.current.position.x = -offset.x / zoom;
-      cameraRef.current.position.y = -offset.y / zoom;
-      cameraRef.current.zoom = zoom;
-      cameraRef.current.updateProjectionMatrix();
-    }
-  }, [offset, zoom]);
+    const canvas = canvasRef.current;
+    const offCanvas = offscreenCanvas.current;
+    if (!canvas || !offCanvas) return;
 
-  // Strokes ni render qilish
+    const resize = () => {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      scheduleDraw();
+    };
+
+    // Wheel event listener ni to'g'ridan-to'g'ri canvas ga qo'shish
+    const addWheelListener = () => {
+      if (canvas) {
+        canvas.addEventListener('wheel', handleWheel, { passive: false });
+      }
+    };
+
+    window.addEventListener('resize', resize);
+    addWheelListener();
+    resize();
+    
+    return () => {
+      window.removeEventListener('resize', resize);
+      if (canvas) {
+        canvas.removeEventListener('wheel', handleWheel);
+      }
+      if (animationFrame.current) {
+        cancelAnimationFrame(animationFrame.current);
+      }
+    };
+  }, [scheduleDraw, handleWheel]);
+
   useEffect(() => {
-    if (!sceneRef.current) return;
-
-    // Eski liniyalarni o'chirish
-    linesRef.current.forEach((line) => sceneRef.current?.remove(line));
-    linesRef.current = [];
-
-    // Yangi liniyalarni qo'shish
-    strokes.forEach((stroke) => {
-      const geometry = new THREE.BufferGeometry();
-      const vertices = new Float32Array([
-        stroke.start.x, stroke.start.y, 0,
-        stroke.end.x, stroke.end.y, 0
-      ]);
-      geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
-      const material = new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 2 / zoom });
-      const line = new THREE.Line(geometry, material);
-      sceneRef.current?.add(line);
-      linesRef.current.push(line);
+    pathCache.current = strokes.map((stroke) => {
+      const origin = worldOrigin.current;
+      const path = new Path2D();
+      path.moveTo(stroke.start.x + origin.x, stroke.start.y + origin.y);
+      path.lineTo(stroke.end.x + origin.x, stroke.end.y + origin.y);
+      return path;
     });
-  }, [strokes, zoom]);
+    scheduleDraw();
+  }, [strokes, scheduleDraw]);
 
-  // Clear canvas bo'lganda sahna tozalash
-  useEffect(() => {
-    if (strokes.length === 0 && sceneRef.current) {
-      linesRef.current.forEach((line) => sceneRef.current?.remove(line));
-      linesRef.current = [];
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    if (mode === 'draw') {
+      setIsDrawing(true);
+      const pos = getCanvasCoords(e.clientX, e.clientY);
+      setLastPos(pos);
+    } else if (mode === 'pan') {
+      setStartPan({ x: e.clientX, y: e.clientY });
     }
-  }, [strokes]);
+  }, [mode, getCanvasCoords, setIsDrawing, setLastPos, setStartPan]);
 
-  // Event Handlers
-  const handleMouseDown = useCallback(
-    (e: React.MouseEvent) => {
-      if (mode === 'draw') {
-        setIsDrawing(true);
-        const pos = getCanvasCoords(e.clientX, e.clientY);
-        setLastPos(pos);
-        addStroke({ start: pos, end: pos });
-      } else if (mode === 'pan') {
-        setStartPan({ x: e.clientX, y: e.clientY });
-      }
-    },
-    [mode, getCanvasCoords, setIsDrawing, setLastPos, setStartPan, addStroke]
-  );
-
-  const handleMouseMove = useCallback(
-    throttle((e: React.MouseEvent) => {
-      if (mode === 'draw' && isDrawing) {
-        const currentPos = getCanvasCoords(e.clientX, e.clientY);
-        addStroke({ start: lastPos, end: currentPos });
-        setLastPos(currentPos);
-      } else if (mode === 'pan' && startPan) {
-        const dx = e.clientX - startPan.x;
-        const dy = e.clientY - startPan.y;
-        setOffset({ x: offset.x + dx, y: offset.y + dy });
-        setStartPan({ x: e.clientX, y: e.clientY });
-      }
-    }, 16),
-    [mode, isDrawing, startPan, lastPos, offset, getCanvasCoords, addStroke, setLastPos, setOffset, setStartPan]
-  );
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    if (mode === 'draw' && isDrawing) {
+      const currentPos = getCanvasCoords(e.clientX, e.clientY);
+      addStroke({ start: lastPos, end: currentPos });
+      setLastPos(currentPos);
+    } else if (mode === 'pan' && startPan) {
+      const dx = e.clientX - startPan.x;
+      const dy = e.clientY - startPan.y;
+      setOffset({ x: offset.x + dx, y: offset.y + dy });
+      setStartPan({ x: e.clientX, y: e.clientY });
+    }
+  }, [mode, isDrawing, startPan, lastPos, offset, getCanvasCoords, addStroke, setLastPos, setOffset, setStartPan]);
 
   const handleMouseUp = useCallback(() => {
     setIsDrawing(false);
     setStartPan(null);
   }, [setIsDrawing, setStartPan]);
-
-  const handleWheel = useCallback(
-    throttle((e: React.WheelEvent) => {
-      e.preventDefault();
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-
-      const rect = canvas.getBoundingClientRect();
-      const mouseX = e.clientX - rect.left;
-      const mouseY = e.clientY - rect.top;
-
-      const worldX = (mouseX - offset.x) / zoom;
-      const worldY = (mouseY - offset.y) / zoom;
-
-      const zoomFactor = 1.0 - e.deltaY * 0.001;
-      const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom * zoomFactor));
-
-      const newOffsetX = mouseX - worldX * newZoom;
-      const newOffsetY = mouseY - worldY * newZoom;
-
-      setZoom(newZoom);
-      setOffset({ x: newOffsetX, y: newOffsetY });
-    }, 16),
-    [offset, zoom, setZoom, setOffset]
-  );
 
   return {
     mode,
@@ -282,7 +236,7 @@ export const useBoard = (): BoardState => {
       onMouseMove: handleMouseMove,
       onMouseUp: handleMouseUp,
       onMouseLeave: handleMouseUp,
-      onWheel: handleWheel,
+      // onWheel ni olib tashlash, chunki uni to'g'ridan-to'g'ri addEventListener bilan qo'shyapmiz
     },
   };
 };

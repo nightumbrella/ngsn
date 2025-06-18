@@ -8,3 +8,13 @@ export const CANVAS_BOARD_CONSTANTS = {
     GRID_BACKGROUND: '#ffffff',
     OFFSCREEN_CANVAS_SIZE:{width: 8000, height: 8000},
 }
+
+
+// export const CANVAS_BOARD_CONSTANTS = {
+//     MIN_ZOOM: 0.2,
+//     MAX_ZOOM: 5,
+//     OFFSCREEN_CANVAS_SIZE: { width: 4096, height: 4096 },
+//     DOT_SPACING: 25,
+//     DOT_RADIUS: 1,
+//     THROTTLE_LIMIT: 16, // Sichqoncha harakatini cheklash (taxminan 60 FPS)
+// };
