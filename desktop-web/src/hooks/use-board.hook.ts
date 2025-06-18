@@ -1,7 +1,25 @@
+'use client'
+
+import * as THREE from 'three';
 import { useRef, useEffect, useCallback } from 'react';
 import {CANVAS_BOARD_CONSTANTS} from '../constants/canvas-board.constants'
 import { useBoardStore } from '@/context/use-board-store';
 const {MIN_ZOOM,MAX_ZOOM,OFFSCREEN_CANVAS_SIZE} = CANVAS_BOARD_CONSTANTS;
+
+
+// Throttle funksiyasi
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const throttle = <T extends (...args: any[]) => any>(func: T, limit: number): ((...args: Parameters<T>) => void) => {
+  let inThrottle: boolean;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return function (this: any, ...args: Parameters<T>) {
+    if (!inThrottle) {
+      func.apply(this, args);
+      inThrottle = true;
+      setTimeout(() => (inThrottle = false), limit);
+    }
+  };
+};
 
 // Hook'da qaytariladigan qiymatlar uchun interfeys
 interface BoardState {
@@ -21,8 +39,10 @@ interface BoardState {
 
 export const useBoard = (): BoardState => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const worldOriginRef = useRef({ x: OFFSCREEN_CANVAS_SIZE.width / 2, y: OFFSCREEN_CANVAS_SIZE.height / 2 });
+  const sceneRef = useRef<THREE.Scene | null>(null);
+  const cameraRef = useRef<THREE.OrthographicCamera | null>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const linesRef = useRef<THREE.Line[]>([]);
 
   // Zustand store'dan holatlarni olish
   const {
@@ -47,99 +67,148 @@ export const useBoard = (): BoardState => {
   // Kanvas koordinatalarini hisoblash
   const getCanvasCoords = useCallback(
     (clientX: number, clientY: number) => {
-      return {
-        x: (clientX - offset.x) / zoom,
-        y: (clientY - offset.y) / zoom,
-      };
+      const canvas = canvasRef.current;
+      if (!canvas) return { x: 0, y: 0 };
+      const rect = canvas.getBoundingClientRect();
+      const x = ((clientX - rect.left) - offset.x) / zoom;
+      const y = -((clientY - rect.top) - offset.y) / zoom; // Y o'qi teskari
+      return { x, y };
     },
     [offset, zoom]
   );
 
-  // Asosiy kanvasni chizish funksiyasi
-  const drawMainCanvas = useCallback(() => {
-    const canvas = canvasRef.current;
-    const offscreen = offscreenCanvasRef.current;
-    if (!canvas || !offscreen) return;
-    const ctx = canvas.getContext('2d');
-    const offCtx = offscreen.getContext('2d');
-    if (!ctx || !offCtx) return;
-
-    // Asosiy kanvasni tozalash
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.fillStyle = '#f0f0f0';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    // Grid (nuqtali to'r) chizish
-    ctx.save();
-    ctx.translate(offset.x, offset.y);
-    ctx.scale(zoom, zoom);
-
-    const spacing = 20;
-    const dotRadius = 1;
-    ctx.fillStyle = '#ccc';
-    const viewBounds = {
-      xMin: -offset.x / zoom,
-      xMax: (canvas.width - offset.x) / zoom,
-      yMin: -offset.y / zoom,
-      yMax: (canvas.height - offset.y) / zoom,
-    };
-    const xStart = Math.floor(viewBounds.xMin / spacing) * spacing;
-    const yStart = Math.floor(viewBounds.yMin / spacing) * spacing;
-    for (let x = xStart; x < viewBounds.xMax; x += spacing) {
-      for (let y = yStart; y < viewBounds.yMax; y += spacing) {
-        ctx.beginPath();
-        ctx.arc(x, y, dotRadius / zoom, 0, 2 * Math.PI);
-        ctx.fill();
-      }
-    }
-
-    // Offscreen kanvasga chizilganlarni yangilash
-    offCtx.clearRect(0, 0, offscreen.width, offscreen.height);
-    offCtx.strokeStyle = '#000000';
-    offCtx.lineWidth = 2 / zoom;
-    offCtx.lineCap = 'round';
-    offCtx.lineJoin = 'round';
-    const origin = worldOriginRef.current;
-    strokes.forEach((stroke) => {
-      offCtx.beginPath();
-      offCtx.moveTo(stroke.start.x + origin.x, stroke.start.y + origin.y);
-      offCtx.lineTo(stroke.end.x + origin.x, stroke.end.y + origin.y);
-      offCtx.stroke();
-    });
-
-    // Offscreen kanvasni asosiy kanvasga chizish
-    ctx.drawImage(offscreen, -origin.x, -origin.y);
-    ctx.restore();
-  }, [offset, zoom, strokes]);
-
-  // Kanvasni initsializatsiya qilish va o'lcham o'zgarganda qayta chizish
+  // Sahna va rendererni sozlash
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const handleResize = () => {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
-      drawMainCanvas();
+    // Sahna yaratish
+    const scene = new THREE.Scene();
+    sceneRef.current = scene;
+
+    // Ortografik kamera
+    const aspect = window.innerWidth / window.innerHeight;
+    const frustumSize = OFFSCREEN_CANVAS_SIZE.height;
+    const camera = new THREE.OrthographicCamera(
+      (frustumSize * aspect) / -2,
+      (frustumSize * aspect) / 2,
+      frustumSize / 2,
+      frustumSize / -2,
+      0.1,
+      1000
+    );
+    camera.position.z = 10;
+    cameraRef.current = camera;
+
+    // Renderer
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0xf0f0f0);
+    rendererRef.current = renderer;
+
+    // Grid yaratish
+    const gridGeometry = new THREE.PlaneGeometry(OFFSCREEN_CANVAS_SIZE.width, OFFSCREEN_CANVAS_SIZE.height);
+    const gridMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        spacing: { value: 20.0 },
+        dotRadius: { value: 0.5 },
+        color: { value: new THREE.Color(0xcccccc) },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform float spacing;
+        uniform float dotRadius;
+        uniform vec3 color;
+        varying vec2 vUv;
+        void main() {
+          vec2 grid = fract(vUv * vec2(${OFFSCREEN_CANVAS_SIZE.width.toFixed(1)}, ${OFFSCREEN_CANVAS_SIZE.height.toFixed(1)}) / spacing);
+          float dist = length(grid);
+          if (dist < dotRadius / spacing) {
+            gl_FragColor = vec4(color, 1.0);
+          } else {
+            discard;
+          }
+        }
+      `,
+      transparent: true,
+    });
+    const gridMesh = new THREE.Mesh(gridGeometry, gridMaterial);
+    scene.add(gridMesh);
+
+    // Render loop
+    const animate = () => {
+      if (!rendererRef.current || !sceneRef.current || !cameraRef.current) return;
+      requestAnimationFrame(animate);
+      rendererRef.current.render(sceneRef.current, cameraRef.current);
     };
+    animate();
 
-    if (!offscreenCanvasRef.current) {
-      const off = document.createElement('canvas');
-      off.width = OFFSCREEN_CANVAS_SIZE.width;
-      off.height = OFFSCREEN_CANVAS_SIZE.height;
-      offscreenCanvasRef.current = off;
-      worldOriginRef.current = { x: off.width / 2, y: off.height / 2 };
-    }
-
+    // Resize handler
+    const handleResize = () => {
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      renderer.setSize(width, height);
+      camera.left = (frustumSize * (width / height)) / -2;
+      camera.right = (frustumSize * (width / height)) / 2;
+      camera.top = frustumSize / 2;
+      camera.bottom = frustumSize / -2;
+      camera.updateProjectionMatrix();
+    };
     window.addEventListener('resize', handleResize);
     handleResize();
-    return () => window.removeEventListener('resize', handleResize);
-  }, [drawMainCanvas]);
 
-  // Holat o'zgarganda kanvasni qayta chizish
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      renderer.dispose();
+    };
+  }, []);
+
+  // Kamera pozitsiyasini yangilash
   useEffect(() => {
-    drawMainCanvas();
-  }, [drawMainCanvas]);
+    if (cameraRef.current) {
+      cameraRef.current.position.x = -offset.x / zoom;
+      cameraRef.current.position.y = -offset.y / zoom;
+      cameraRef.current.zoom = zoom;
+      cameraRef.current.updateProjectionMatrix();
+    }
+  }, [offset, zoom]);
+
+  // Strokes ni render qilish
+  useEffect(() => {
+    if (!sceneRef.current) return;
+
+    // Eski liniyalarni o'chirish
+    linesRef.current.forEach((line) => sceneRef.current?.remove(line));
+    linesRef.current = [];
+
+    // Yangi liniyalarni qo'shish
+    strokes.forEach((stroke) => {
+      const geometry = new THREE.BufferGeometry();
+      const vertices = new Float32Array([
+        stroke.start.x, stroke.start.y, 0,
+        stroke.end.x, stroke.end.y, 0
+      ]);
+      geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+      const material = new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 2 / zoom });
+      const line = new THREE.Line(geometry, material);
+      sceneRef.current?.add(line);
+      linesRef.current.push(line);
+    });
+  }, [strokes, zoom]);
+
+  // Clear canvas bo'lganda sahna tozalash
+  useEffect(() => {
+    if (strokes.length === 0 && sceneRef.current) {
+      linesRef.current.forEach((line) => sceneRef.current?.remove(line));
+      linesRef.current = [];
+    }
+  }, [strokes]);
 
   // Event Handlers
   const handleMouseDown = useCallback(
@@ -148,15 +217,16 @@ export const useBoard = (): BoardState => {
         setIsDrawing(true);
         const pos = getCanvasCoords(e.clientX, e.clientY);
         setLastPos(pos);
+        addStroke({ start: pos, end: pos });
       } else if (mode === 'pan') {
         setStartPan({ x: e.clientX, y: e.clientY });
       }
     },
-    [mode, getCanvasCoords, setIsDrawing, setLastPos, setStartPan]
+    [mode, getCanvasCoords, setIsDrawing, setLastPos, setStartPan, addStroke]
   );
 
   const handleMouseMove = useCallback(
-    (e: React.MouseEvent) => {
+    throttle((e: React.MouseEvent) => {
       if (mode === 'draw' && isDrawing) {
         const currentPos = getCanvasCoords(e.clientX, e.clientY);
         addStroke({ start: lastPos, end: currentPos });
@@ -167,7 +237,7 @@ export const useBoard = (): BoardState => {
         setOffset({ x: offset.x + dx, y: offset.y + dy });
         setStartPan({ x: e.clientX, y: e.clientY });
       }
-    },
+    }, 16),
     [mode, isDrawing, startPan, lastPos, offset, getCanvasCoords, addStroke, setLastPos, setOffset, setStartPan]
   );
 
@@ -177,7 +247,7 @@ export const useBoard = (): BoardState => {
   }, [setIsDrawing, setStartPan]);
 
   const handleWheel = useCallback(
-    (e: React.WheelEvent) => {
+    throttle((e: React.WheelEvent) => {
       e.preventDefault();
       const canvas = canvasRef.current;
       if (!canvas) return;
@@ -197,7 +267,7 @@ export const useBoard = (): BoardState => {
 
       setZoom(newZoom);
       setOffset({ x: newOffsetX, y: newOffsetY });
-    },
+    }, 16),
     [offset, zoom, setZoom, setOffset]
   );
 

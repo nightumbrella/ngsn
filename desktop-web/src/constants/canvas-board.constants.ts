@@ -1,6 +1,6 @@
 export const CANVAS_BOARD_CONSTANTS = {
-    MIN_ZOOM: 0.2,
-    MAX_ZOOM: 8.0,
+    MIN_ZOOM: 0.5,
+    MAX_ZOOM: 2,
     ZOOM_SPEED: 0.001,
     GRID_SIZE: 20,
     GRID_COLOR: '#e0e0e0',
